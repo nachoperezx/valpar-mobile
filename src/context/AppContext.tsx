@@ -1,7 +1,31 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { Place, User, Visit, CustomerConsent } from '../types';
-import { PLACES_DATA } from '../data/places';
+import { Platform } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
+import * as Location from 'expo-location';
 import { APP_CONFIG } from '../config';
+
+const TOKEN_STORAGE_KEY = 'valpar_auth_token';
+
+// SecureStore has no web implementation; on web the session lasts only for the page load
+async function persistToken(token: string | null) {
+  if (Platform.OS === 'web') return;
+  try {
+    if (token) await SecureStore.setItemAsync(TOKEN_STORAGE_KEY, token);
+    else await SecureStore.deleteItemAsync(TOKEN_STORAGE_KEY);
+  } catch {
+    // Storage failure only means the user has to log in again next launch
+  }
+}
+
+async function readStoredToken(): Promise<string | null> {
+  if (Platform.OS === 'web') return null;
+  try {
+    return await SecureStore.getItemAsync(TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
 
 export type ActiveTab = 'home' | 'discover' | 'map' | 'passport' | 'profile';
 
@@ -105,8 +129,57 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
+  // Loads the signed-in user's server-side state (visits and favorites)
+  const loadUserData = async (token: string) => {
+    const headers = { Authorization: `Bearer ${token}` };
+    try {
+      const [visitsRes, favRes] = await Promise.all([
+        fetch(`${APP_CONFIG.API_BASE_URL}/checkins/visits`, { headers }),
+        fetch(`${APP_CONFIG.API_BASE_URL}/places/favorites/me`, { headers })
+      ]);
+      const visitsData = await visitsRes.json();
+      const favData = await favRes.json();
+      if (visitsData?.success && Array.isArray(visitsData.visits)) {
+        setVisits(visitsData.visits);
+        setVisitedPlaceIds([...new Set<string>(visitsData.visits.map((v: Visit) => v.placeId))]);
+      }
+      if (favData?.success && Array.isArray(favData.places)) {
+        setFavorites(favData.places.map((p: Place) => p.id));
+      }
+    } catch {
+      // Non-critical: the session stays valid even if history fails to load
+    }
+  };
+
+  const startSession = (sessionUser: User, token: string) => {
+    setUser(sessionUser);
+    setAuthToken(token);
+    persistToken(token);
+    loadUserData(token);
+  };
+
+  // Restore a saved session on launch
+  const restoreSession = async () => {
+    const token = await readStoredToken();
+    if (!token) return;
+    try {
+      const res = await fetch(`${APP_CONFIG.API_BASE_URL}/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.status === 401) {
+        await persistToken(null);
+        return;
+      }
+      const data = await res.json();
+      if (data?.success && data.user) startSession(data.user, token);
+    } catch {
+      // Offline at launch: keep the token stored and try again next launch
+    }
+  };
+
   useEffect(() => {
     fetchAPIPlaces();
+    restoreSession();
   }, []);
 
   // Login Handler
@@ -120,8 +193,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const data = await res.json();
 
       if (data.success && data.user) {
-        setUser(data.user);
-        setAuthToken(data.token);
+        startSession(data.user, data.token);
         return { success: true, message: data.message };
       }
       return { success: false, message: data.message || 'Error al iniciar sesión.' };
@@ -141,8 +213,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const data = await res.json();
 
       if (data.success && data.user) {
-        setUser(data.user);
-        setAuthToken(data.token);
+        startSession(data.user, data.token);
         return { success: true, message: data.message };
       }
       return { success: false, message: data.message || 'Error al registrar usuario.' };
@@ -162,8 +233,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const data = await res.json();
 
       if (data.success && data.user) {
-        setUser(data.user);
-        setAuthToken(data.token);
+        startSession(data.user, data.token);
         return { success: true, message: data.message };
       }
       return { success: false, message: data.message || 'Error de Google OAuth.' };
@@ -176,6 +246,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const logout = () => {
     setUser(null);
     setAuthToken(null);
+    persistToken(null);
     setFavorites([]);
     setVisitedPlaceIds([]);
     setVisits([]);
@@ -235,20 +306,33 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const triggerNfcCheckIn = async (placeId: string) => {
     const target = places.find(p => p.id === placeId);
     if (!target) return { success: false, message: 'Lugar no encontrado.' };
-    if (!user) return { success: false, message: 'Inicia sesión para registrar tu visita y acumular puntos.' };
+    if (!user || !authToken) return { success: false, message: 'Inicia sesión para registrar tu visita y acumular puntos.' };
+
+    // The backend validates that the user is physically at the place
+    let coords: Location.LocationObjectCoords;
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        return { success: false, message: 'Activa el permiso de ubicación para validar tu visita en el local.' };
+      }
+      coords = (await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High })).coords;
+    } catch {
+      return { success: false, message: 'No pudimos obtener tu ubicación GPS. Inténtalo nuevamente.' };
+    }
 
     try {
       const res = await fetch(`${APP_CONFIG.API_BASE_URL}/checkins`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {})
+          Authorization: `Bearer ${authToken}`
         },
         body: JSON.stringify({
           placeId,
-          userId: user.id,
-          userLat: target.location.latitude,
-          userLng: target.location.longitude
+          userLat: coords.latitude,
+          userLng: coords.longitude,
+          accuracyMeters: coords.accuracy ?? undefined,
+          deviceInfo: `${Platform.OS} ${Platform.Version}`
         })
       });
 

@@ -22,7 +22,13 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "VALPAR usa tu ubicación para mostrarte lugares cercanos y validar tus visitas en los locales."
+        }
+      ]
     ]
   }
 }
